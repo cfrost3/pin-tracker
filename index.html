@@ -1,70 +1,50 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
-<title>Pin Valuator</title>
+// image-match-service.js — calls YOUR OWN backend, which in turn calls
+// Google Cloud Vision's Web Detection API.
+//
+// WHY A BACKEND IS REQUIRED: API keys embedded in client-side JS are
+// visible to anyone who opens browser dev tools or views page source.
+// There is no way to hide them in a pure static PWA. You must proxy this
+// call through a small backend you control (a Cloudflare Worker, Vercel
+// function, or similar) that holds the real API key server-side.
+//
+// Until BACKEND_URL is configured, this runs in DEMO MODE: it returns a
+// single low-confidence placeholder match so the rest of the app (tagging,
+// pricing, saving) is fully exercisable without a working backend yet.
 
-<!-- Standard PWA manifest -->
-<link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#1A1A2E">
-
-<!-- iOS-specific tags: without these, "Add to Home Screen" still works,
-     but the app opens inside Safari's UI chrome instead of fullscreen,
-     and uses a generic screenshot icon instead of the real app icon. -->
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Pin Valuator">
-<link rel="apple-touch-icon" href="icons/icon-180.png">
-
-<link rel="stylesheet" href="css/styles.css">
-</head>
-<body>
-
-<div id="app">
-  <header class="app-header top-safe-area">
-    <span id="header-title">Pin Valuator</span>
-    <div class="actions" id="header-actions"></div>
-  </header>
-
-  <main id="main-content">
-    <!-- Views are rendered here by app.js -->
-  </main>
-
-  <nav class="tab-bar">
-    <button data-tab="scan" class="tab-btn">
-      <span class="icon">📷</span><span>Scan</span>
-    </button>
-    <button data-tab="collection" class="tab-btn">
-      <span class="icon">🗂️</span><span>Collection</span>
-    </button>
-    <button data-tab="stats" class="tab-btn">
-      <span class="icon">📈</span><span>Stats</span>
-    </button>
-  </nav>
-</div>
-
-<div id="sheet-root"></div>
-<div id="toast-root"></div>
-
-<script src="js/db.js"></script>
-<script src="js/photos.js"></script>
-<script src="js/filtering.js"></script>
-<script src="js/pin-tag-extractor.js"></script>
-<script src="js/ocr.js"></script>
-<script src="js/image-match-service.js"></script>
-<script src="js/price-service.js"></script>
-<script src="js/identify-pipeline.js"></script>
-<script src="js/lot-detection.js"></script>
-<script src="js/scan.js"></script>
-<script src="js/lot-scan.js"></script>
-<script src="js/app.js"></script>
-<script>
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW registration failed', err));
-    });
+const ImageMatchService = (() => {
+  function backendUrl() {
+    return BackendConfig.WORKER_BASE_URL ? BackendConfig.WORKER_BASE_URL + '/match' : null;
   }
-</script>
-</body>
-</html>
+
+  async function search(blob, vocabulary) {
+    const url = backendUrl();
+    if (!url) {
+      return demoMatch();
+    }
+
+    const formData = new FormData();
+    formData.append('image', blob);
+
+    const response = await fetch(url, { method: 'POST', body: formData });
+    if (!response.ok) throw new Error('Match service returned an error');
+    const data = await response.json();
+
+    return (data.matches || []).map(m => ({
+      ...m,
+      extractedTags: PinTagExtractor.extractFromTexts(m.pageTitles || [m.name], vocabulary)
+    }));
+  }
+
+  function demoMatch() {
+    return [{
+      name: 'Unidentified item (demo mode)',
+      series: null,
+      releaseYear: null,
+      itemIdentifier: null,
+      confidence: 0.3,
+      extractedTags: { characters: [], movie: null, holiday: null, park: null, attraction: null }
+    }];
+  }
+
+  return { search };
+})();
