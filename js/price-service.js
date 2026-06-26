@@ -9,10 +9,13 @@
 // as actual valuations.
 
 const PriceService = (() => {
-  const BACKEND_URL = null; // e.g. 'https://your-worker.workers.dev/price'
+  function backendUrl() {
+    return BackendConfig.WORKER_BASE_URL ? BackendConfig.WORKER_BASE_URL + '/price' : null;
+  }
 
   async function estimateValue(item) {
-    if (!BACKEND_URL) {
+    const baseUrl = backendUrl();
+    if (!baseUrl) {
       return demoEstimate();
     }
 
@@ -21,7 +24,7 @@ const PriceService = (() => {
       ? cat.ebayKeyword + ' ' + item.itemIdentifier
       : [cat.ebayKeyword, item.name, item.series].filter(Boolean).join(' ');
 
-    const response = await fetch(BACKEND_URL + '?q=' + encodeURIComponent(query) + '&category=' + cat.ebayCategoryId);
+    const response = await fetch(baseUrl + '?q=' + encodeURIComponent(query) + '&category=' + cat.ebayCategoryId);
     if (!response.ok) throw new Error('Could not reach price service');
     const data = await response.json();
 

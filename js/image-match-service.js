@@ -12,17 +12,20 @@
 // pricing, saving) is fully exercisable without a working backend yet.
 
 const ImageMatchService = (() => {
-  const BACKEND_URL = null; // e.g. 'https://your-worker.workers.dev/match'
+  function backendUrl() {
+    return BackendConfig.WORKER_BASE_URL ? BackendConfig.WORKER_BASE_URL + '/match' : null;
+  }
 
   async function search(blob, vocabulary) {
-    if (!BACKEND_URL) {
+    const url = backendUrl();
+    if (!url) {
       return demoMatch();
     }
 
     const formData = new FormData();
     formData.append('image', blob);
 
-    const response = await fetch(BACKEND_URL, { method: 'POST', body: formData });
+    const response = await fetch(url, { method: 'POST', body: formData });
     if (!response.ok) throw new Error('Match service returned an error');
     const data = await response.json();
 

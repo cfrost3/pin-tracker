@@ -86,12 +86,17 @@ async function render() {
 
 async function renderCollectionTab() {
   mainEl.innerHTML =
+    '<div style="display:flex; justify-content:flex-end; margin-bottom:8px;">' +
+      '<button class="chip" id="export-import-btn">⇄ Export / Import</button>' +
+    '</div>' +
     '<div class="segmented" id="collection-segmented">' +
       '<button data-seg="inventory">My items</button>' +
       '<button data-seg="wishlist">Wishlist</button>' +
       '<button data-seg="ledger">Bought / sold</button>' +
     '</div>' +
     '<div id="collection-body"></div>';
+
+  document.getElementById('export-import-btn').addEventListener('click', openExportImportSheet);
 
   document.querySelectorAll('#collection-segmented button').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.seg === state.collectionSegment);
@@ -108,6 +113,90 @@ async function renderCollectionTab() {
   } else {
     await renderLedgerBody();
   }
+}
+
+// MARK: - Export / Import
+
+function openExportImportSheet() {
+  openSheet(
+    '<div class="sheet-header"><h2>Export / Import</h2><button id="sheet-close">Done</button></div>' +
+    '<div class="card">' +
+    '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Export your collection</p>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Saves everything — items, inventory, wishlist, sale history, and photos — into one file you can send to someone else or keep as a backup.</p>' +
+    '<button class="btn block primary" id="export-btn">⬇ Export collection</button>' +
+    '</div>' +
+    '<div class="card">' +
+    '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Import a collection</p>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Adds items from someone else\'s exported file into yours. Nothing of yours gets overwritten — imported items are added alongside what you already have.</p>' +
+    '<button class="btn block" id="import-btn">⬆ Choose file to import</button>' +
+    '<input type="file" id="import-file-input" accept=".json,application/json" style="display:none;">' +
+    '</div>' +
+    '<div id="export-import-status" style="font-size:12px; color:var(--text-secondary); text-align:center;"></div>',
+    () => {
+      document.getElementById('sheet-close').addEventListener('click', () => { closeSheet(); renderCollectionTab(); });
+
+      document.getElementById('export-btn').addEventListener('click', async () => {
+        const statusEl = document.getElementById('export-import-status');
+        statusEl.textContent = 'Preparing export…';
+        try {
+          const result = await ExportImport.exportToFile();
+          statusEl.textContent = 'Exported ' + result.itemCount + ' item' + (result.itemCount === 1 ? '' : 's') + ' to ' + result.filename;
+        } catch (err) {
+          statusEl.textContent = 'Export failed: ' + (err.message || 'unknown error');
+        }
+      });
+
+      document.getElementById('import-btn').addEventListener('click', () => {
+        document.getElementById('import-file-input').click();
+      });
+
+      document.getElementById('import-file-input').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const statusEl = document.getElementById('export-import-status');
+        statusEl.textContent = 'Reading file…';
+        try {
+          const { payload, summary } = await ExportImport.parseImportFile(file);
+          openImportPreviewSheet(payload, summary);
+        } catch (err) {
+          statusEl.textContent = err.message;
+        }
+      });
+    }
+  );
+}
+
+function openImportPreviewSheet(payload, summary) {
+  const exportedDate = summary.exportedAt ? new Date(summary.exportedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'unknown date';
+
+  openSheet(
+    '<div class="sheet-header"><h2>Import preview</h2><button id="sheet-close">Cancel</button></div>' +
+    '<div class="card">' +
+    '<p style="font-size:13px; color:var(--text-secondary); margin:0 0 10px;">This file was exported on ' + exportedDate + ' and contains:</p>' +
+    '<div style="display:flex; justify-content:space-between; padding:4px 0;"><span style="font-size:13px;">Items</span><span style="font-size:13px; font-weight:600;">' + summary.itemCount + '</span></div>' +
+    '<div style="display:flex; justify-content:space-between; padding:4px 0;"><span style="font-size:13px;">In inventory</span><span style="font-size:13px; font-weight:600;">' + summary.inventoryCount + '</span></div>' +
+    '<div style="display:flex; justify-content:space-between; padding:4px 0;"><span style="font-size:13px;">On wishlist</span><span style="font-size:13px; font-weight:600;">' + summary.wishlistCount + '</span></div>' +
+    '<div style="display:flex; justify-content:space-between; padding:4px 0;"><span style="font-size:13px;">Sale records</span><span style="font-size:13px; font-weight:600;">' + summary.transactionCount + '</span></div>' +
+    '</div>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:10px 0;">These will be added to your existing collection — nothing you already have will be changed or removed.</p>' +
+    '<button class="btn block primary" id="confirm-import-btn">Import ' + summary.itemCount + ' item' + (summary.itemCount === 1 ? '' : 's') + '</button>' +
+    '<div id="import-status" style="font-size:12px; color:var(--text-secondary); text-align:center; margin-top:10px;"></div>',
+    () => {
+      document.getElementById('sheet-close').addEventListener('click', () => { closeSheet(); renderCollectionTab(); });
+      document.getElementById('confirm-import-btn').addEventListener('click', async () => {
+        const statusEl = document.getElementById('import-status');
+        statusEl.textContent = 'Importing…';
+        try {
+          const result = await ExportImport.commitImport(payload);
+          statusEl.textContent = 'Imported ' + result.importedItems + ' items.';
+          showToast('Import complete');
+          setTimeout(() => { closeSheet(); renderCollectionTab(); }, 800);
+        } catch (err) {
+          statusEl.textContent = 'Import failed: ' + (err.message || 'unknown error');
+        }
+      });
+    }
+  );
 }
 
 async function renderInventoryBody() {
