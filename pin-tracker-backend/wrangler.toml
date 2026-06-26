@@ -1,0 +1,8 @@
+name = "pin-valuator-backend"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Secrets (API keys/tokens) are NOT set here — they're added via the CLI
+# with `wrangler secret put <NAME>` so they never get committed to git or
+# appear in this plaintext config file. See README.md for the exact
+# commands to run.
