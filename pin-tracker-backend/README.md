@@ -123,18 +123,25 @@ you have a real deployed URL.
 
 ## Part 5 -- Point the PWA at your Worker
 
-In the PWA's `js/image-match-service.js` and `js/price-service.js`, find:
+Open `js/backend-config.js` in the PWA project. Find:
 
 ```js
-const BACKEND_URL = null;
+const BackendConfig = {
+  WORKER_BASE_URL: null
+};
 ```
 
-Change it to your Worker URL plus the right path:
+Change `null` to your deployed Worker's base URL (no trailing slash, no
+`/match` or `/price` -- those paths get appended automatically):
 
-- `image-match-service.js`:
-  `const BACKEND_URL = 'https://pin-valuator-backend.YOUR-SUBDOMAIN.workers.dev/match';`
-- `price-service.js`:
-  `const BACKEND_URL = 'https://pin-valuator-backend.YOUR-SUBDOMAIN.workers.dev/price';`
+```js
+const BackendConfig = {
+  WORKER_BASE_URL: 'https://pin-valuator-backend.YOUR-SUBDOMAIN.workers.dev'
+};
+```
+
+This is the only file you need to edit -- both `image-match-service.js`
+and `price-service.js` read from it automatically.
 
 Redeploy/re-push the PWA, and you're now getting real reverse-image
 matches and real (or scrape-sourced) sold-price estimates instead of

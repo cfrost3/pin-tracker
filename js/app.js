@@ -6,8 +6,18 @@ const state = {
   collectionSegment: 'inventory', // inventory | wishlist | ledger
   categoryFilter: null,
   activeFilter: Filtering.createActiveFilter(),
-  sortOption: 'dateAcquiredNewest'
+  sortOption: 'dateAcquiredNewest',
+  activeCollectionId: DB.OWN_COLLECTION_ID
 };
+
+/// True when the currently-viewed collection is read-only (i.e. it's an
+/// imported friend's collection, not your own). Every add/edit/delete/sell
+/// action in the Collection tab checks this before doing anything —
+/// centralizing the check here means a single source of truth for "can
+/// the user modify what they're looking at right now."
+function isViewingReadOnlyCollection() {
+  return state.activeCollectionId !== DB.OWN_COLLECTION_ID;
+}
 
 const mainEl = document.getElementById('main-content');
 const headerTitleEl = document.getElementById('header-title');
@@ -85,10 +95,35 @@ async function render() {
 }
 
 async function renderCollectionTab() {
+  const collections = await DB.getAllCollections();
+  // The "own" collection always exists conceptually even before its
+  // record is explicitly created (e.g. brand-new install that hasn't hit
+  // the v2 migration's seed yet) — fall back to a synthetic entry so the
+  // switcher never renders empty.
+  const hasOwnRecord = collections.some(c => c.id === DB.OWN_COLLECTION_ID);
+  const allCollections = hasOwnRecord ? collections : [{ id: DB.OWN_COLLECTION_ID, name: 'My Collection', isOwn: true }, ...collections];
+  const importedCollections = allCollections.filter(c => !c.isOwn);
+
+  const readOnly = isViewingReadOnlyCollection();
+  const activeCollection = allCollections.find(c => c.id === state.activeCollectionId) || allCollections[0];
+
   mainEl.innerHTML =
-    '<div style="display:flex; justify-content:flex-end; margin-bottom:8px;">' +
-      '<button class="chip" id="export-import-btn">⇄ Export / Import</button>' +
-    '</div>' +
+    (importedCollections.length > 0
+      ? '<div class="field" style="margin-bottom:10px;">' +
+        '<select id="collection-switcher" style="width:100%; font-size:13px; padding:8px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface);">' +
+        '<option value="' + DB.OWN_COLLECTION_ID + '" ' + (!readOnly ? 'selected' : '') + '>📁 My Collection</option>' +
+        importedCollections.map(c => '<option value="' + c.id + '" ' + (c.id === state.activeCollectionId ? 'selected' : '') + '>👤 ' + escapeHtml(c.name) + ' (read-only)</option>').join('') +
+        '</select>' +
+        '</div>'
+      : '') +
+    (readOnly
+      ? '<div class="card" style="background:rgba(200,140,40,0.08); display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">' +
+        '<span style="font-size:12px;">👀 Viewing <strong>' + escapeHtml(activeCollection.name) + '</strong> — read-only</span>' +
+        '<button id="remove-collection-btn" style="background:none; border:none; color:var(--enamel-red); font-size:12px;">Remove</button>' +
+        '</div>'
+      : '<div style="display:flex; justify-content:flex-end; margin-bottom:8px;">' +
+        '<button class="chip" id="export-import-btn">⇄ Export / Import</button>' +
+        '</div>') +
     '<div class="segmented" id="collection-segmented">' +
       '<button data-seg="inventory">My items</button>' +
       '<button data-seg="wishlist">Wishlist</button>' +
@@ -96,7 +131,22 @@ async function renderCollectionTab() {
     '</div>' +
     '<div id="collection-body"></div>';
 
-  document.getElementById('export-import-btn').addEventListener('click', openExportImportSheet);
+  const switcher = document.getElementById('collection-switcher');
+  if (switcher) switcher.addEventListener('change', (e) => {
+    state.activeCollectionId = e.target.value;
+    state.categoryFilter = null;
+    Filtering.clearFilter(state.activeFilter);
+    renderCollectionTab();
+  });
+
+  document.getElementById('export-import-btn')?.addEventListener('click', openExportImportSheet);
+  document.getElementById('remove-collection-btn')?.addEventListener('click', async () => {
+    if (confirm('Remove "' + activeCollection.name + '" from your view? This deletes the imported copy on this device only — it does not affect their actual collection.')) {
+      await DB.deleteCollectionCascade(activeCollection.id);
+      state.activeCollectionId = DB.OWN_COLLECTION_ID;
+      renderCollectionTab();
+    }
+  });
 
   document.querySelectorAll('#collection-segmented button').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.seg === state.collectionSegment);
@@ -123,11 +173,12 @@ function openExportImportSheet() {
     '<div class="card">' +
     '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Export your collection</p>' +
     '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Saves everything — items, inventory, wishlist, sale history, and photos — into one file you can send to someone else or keep as a backup.</p>' +
+    '<div class="field"><label>Your name (shown to whoever you send this to)</label><input type="text" id="export-owner-name" placeholder="e.g. Alex"></div>' +
     '<button class="btn block primary" id="export-btn">⬇ Export collection</button>' +
     '</div>' +
     '<div class="card">' +
-    '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Import a collection</p>' +
-    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Adds items from someone else\'s exported file into yours. Nothing of yours gets overwritten — imported items are added alongside what you already have.</p>' +
+    '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Import a friend\'s collection</p>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Adds their collection as a separate, read-only view you can browse and compare against your own — it never changes or merges into your collection.</p>' +
     '<button class="btn block" id="import-btn">⬆ Choose file to import</button>' +
     '<input type="file" id="import-file-input" accept=".json,application/json" style="display:none;">' +
     '</div>' +
@@ -137,9 +188,10 @@ function openExportImportSheet() {
 
       document.getElementById('export-btn').addEventListener('click', async () => {
         const statusEl = document.getElementById('export-import-status');
+        const ownerName = document.getElementById('export-owner-name').value.trim();
         statusEl.textContent = 'Preparing export…';
         try {
-          const result = await ExportImport.exportToFile();
+          const result = await ExportImport.exportToFile(ownerName);
           statusEl.textContent = 'Exported ' + result.itemCount + ' item' + (result.itemCount === 1 ? '' : 's') + ' to ' + result.filename;
         } catch (err) {
           statusEl.textContent = 'Export failed: ' + (err.message || 'unknown error');
@@ -168,6 +220,7 @@ function openExportImportSheet() {
 
 function openImportPreviewSheet(payload, summary) {
   const exportedDate = summary.exportedAt ? new Date(summary.exportedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'unknown date';
+  const suggestedName = payload.ownerName ? payload.ownerName + "'s Collection" : 'Imported Collection';
 
   openSheet(
     '<div class="sheet-header"><h2>Import preview</h2><button id="sheet-close">Cancel</button></div>' +
@@ -178,18 +231,21 @@ function openImportPreviewSheet(payload, summary) {
     '<div style="display:flex; justify-content:space-between; padding:4px 0;"><span style="font-size:13px;">On wishlist</span><span style="font-size:13px; font-weight:600;">' + summary.wishlistCount + '</span></div>' +
     '<div style="display:flex; justify-content:space-between; padding:4px 0;"><span style="font-size:13px;">Sale records</span><span style="font-size:13px; font-weight:600;">' + summary.transactionCount + '</span></div>' +
     '</div>' +
-    '<p style="font-size:12px; color:var(--text-secondary); margin:10px 0;">These will be added to your existing collection — nothing you already have will be changed or removed.</p>' +
+    '<div class="field"><label>Name this collection</label><input type="text" id="import-collection-name" value="' + escapeHtml(suggestedName) + '"></div>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:10px 0;">This will be added as a new, separate collection you can switch to and browse — read-only, and completely independent from your own collection.</p>' +
     '<button class="btn block primary" id="confirm-import-btn">Import ' + summary.itemCount + ' item' + (summary.itemCount === 1 ? '' : 's') + '</button>' +
     '<div id="import-status" style="font-size:12px; color:var(--text-secondary); text-align:center; margin-top:10px;"></div>',
     () => {
       document.getElementById('sheet-close').addEventListener('click', () => { closeSheet(); renderCollectionTab(); });
       document.getElementById('confirm-import-btn').addEventListener('click', async () => {
         const statusEl = document.getElementById('import-status');
+        const collectionName = document.getElementById('import-collection-name').value.trim() || suggestedName;
         statusEl.textContent = 'Importing…';
         try {
-          const result = await ExportImport.commitImport(payload);
-          statusEl.textContent = 'Imported ' + result.importedItems + ' items.';
+          const result = await ExportImport.commitImport(payload, collectionName);
+          statusEl.textContent = 'Imported ' + result.importedItems + ' items into "' + collectionName + '".';
           showToast('Import complete');
+          state.activeCollectionId = result.collection.id;
           setTimeout(() => { closeSheet(); renderCollectionTab(); }, 800);
         } catch (err) {
           statusEl.textContent = 'Import failed: ' + (err.message || 'unknown error');
@@ -201,12 +257,14 @@ function openImportPreviewSheet(payload, summary) {
 
 async function renderInventoryBody() {
   const body = document.getElementById('collection-body');
+  const readOnly = isViewingReadOnlyCollection();
 
   headerActionsEl.innerHTML = '<button id="sort-btn">⇅</button><button id="filter-btn">▽</button>';
   document.getElementById('sort-btn').addEventListener('click', openSortSheet);
   document.getElementById('filter-btn').addEventListener('click', () => openFilterSheet());
 
-  const allEntries = await attachItems(await DB.getAllInventoryEntries());
+  const collectionInventory = await DB.getInventoryEntriesByCollection(state.activeCollectionId);
+  const allEntries = await attachItems(collectionInventory);
 
   let entries = allEntries;
   if (state.categoryFilter) {
@@ -244,7 +302,7 @@ async function renderInventoryBody() {
     html += '<div class="empty-state">' +
       '<div class="icon">🗃️</div>' +
       '<p class="title">' + (allEntries.length === 0 ? 'No items yet' : 'No matches') + '</p>' +
-      '<p class="message">' + (allEntries.length === 0 ? 'Scan a pin or other collectible to add it to your collection.' : 'Try a different filter.') + '</p>' +
+      '<p class="message">' + (allEntries.length === 0 ? (readOnly ? 'This collection has no items.' : 'Scan a pin or other collectible to add it to your collection.') : 'Try a different filter.') + '</p>' +
       '</div>';
   } else {
     html += '<div class="grid">' + entries.map(renderPinCard).join('') + '</div>';
@@ -391,17 +449,21 @@ async function openFilterSheet(facetKeyToShow) {
 
 async function renderWishlistBody() {
   const body = document.getElementById('collection-body');
-  const entries = await attachItems(await DB.getAllWishlistEntries());
+  const readOnly = isViewingReadOnlyCollection();
+  const collectionWishlist = await DB.getWishlistEntriesByCollection(state.activeCollectionId);
+  const entries = await attachItems(collectionWishlist);
   entries.sort((a, b) => b.dateAdded - a.dateAdded);
+
+  const addButtonHtml = readOnly ? '' : '<button class="btn block primary" id="add-wishlist-btn" style="margin-top:6px;">+ Add to wishlist</button>';
 
   if (entries.length === 0) {
     body.innerHTML =
       '<div class="empty-state">' +
       '<div class="icon">💗</div>' +
       '<p class="title">Wishlist is empty</p>' +
-      '<p class="message">Scan an item or add one manually to start tracking it.</p>' +
+      '<p class="message">' + (readOnly ? 'This collection has nothing on its wishlist.' : 'Scan an item or add one manually to start tracking it.') + '</p>' +
       '</div>' +
-      '<button class="btn block primary" id="add-wishlist-btn">+ Add to wishlist</button>';
+      addButtonHtml;
   } else {
     body.innerHTML = entries.map(e => {
       const item = e._item;
@@ -417,7 +479,7 @@ async function renderWishlistBody() {
         '<span style="font-size:13px; font-weight:500;">' + fmtCurrency(e.lastKnownMarketLow) + ' / ' + fmtCurrency(e.maxPriceWillingToPay) + '</span>' +
         '</div>' +
         '</div>';
-    }).join('') + '<button class="btn block" id="add-wishlist-btn" style="margin-top:6px;">+ Add to wishlist</button>';
+    }).join('') + addButtonHtml;
   }
 
   const addBtn = document.getElementById('add-wishlist-btn');
@@ -427,8 +489,10 @@ async function renderWishlistBody() {
 
 async function renderLedgerBody() {
   const body = document.getElementById('collection-body');
+  const collectionItems = await DB.getItemsByCollection(state.activeCollectionId);
+  const collectionItemIds = new Set(collectionItems.map(i => i.id));
   const allTx = await attachItems(await DB.getAllTransactions());
-  const sold = allTx.filter(t => t.type === 'sold').sort((a, b) => b.date - a.date);
+  const sold = allTx.filter(t => t.type === 'sold' && collectionItemIds.has(t.itemId)).sort((a, b) => b.date - a.date);
   const realizedPL = sold.reduce((sum, t) => sum + (t.profitLoss || 0), 0);
 
   let html = '<div class="card" style="display:flex; justify-content:space-between; align-items:center;">' +
@@ -458,7 +522,8 @@ async function renderLedgerBody() {
 }
 
 async function openItemDetail(entryId) {
-  const entries = await attachItems(await DB.getAllInventoryEntries());
+  const readOnly = isViewingReadOnlyCollection();
+  const entries = await attachItems(await DB.getInventoryEntriesByCollection(state.activeCollectionId));
   const entry = entries.find(e => e.id === entryId);
   if (!entry) return;
   const item = entry._item;
@@ -476,6 +541,7 @@ async function openItemDetail(entryId) {
 
   mainEl.innerHTML =
     '<button class="btn" id="back-btn" style="margin-bottom:10px; border:none; padding-left:0;">‹ Back</button>' +
+    (readOnly ? '<div class="card" style="background:rgba(200,140,40,0.08); font-size:12px; margin-bottom:10px;">👀 From a friend\'s collection — read-only</div>' : '') +
     '<div class="card">' +
     '<div style="display:flex; gap:14px; margin-bottom:12px;">' +
     '<div class="thumb" data-photo-key="' + (item.userImagePhotoBlobKey || '') + '" style="width:84px; height:84px; flex-shrink:0; margin-bottom:0;"><span class="thumb-fallback">' + DB.CATEGORIES[item.category].icon + '</span></div>' +
@@ -498,7 +564,7 @@ async function openItemDetail(entryId) {
     '</div>' +
     (history.length >= 2 ? '<canvas id="value-chart" height="120"></canvas>' : '<p style="font-size:12px; color:var(--text-secondary);">Re-check value a few times to build a history chart.</p>') +
     (latest && DB.isLowConfidence(latest) ? '<p style="font-size:11px; color:#a06b1f; margin-top:8px;">⚠️ Low confidence — fewer than ' + DB.LOW_CONFIDENCE_THRESHOLD + ' sold comps found</p>' : '') +
-    '<button class="btn block" id="recheck-btn" style="margin-top:10px;">↻ Re-check value</button>' +
+    (readOnly ? '' : '<button class="btn block" id="recheck-btn" style="margin-top:10px;">↻ Re-check value</button>') +
     '</div>' +
 
     (tagPairs.length > 0 ? '<div class="card"><p style="font-size:13px; font-weight:500; margin:0 0 8px;">Tags</p><div class="tags">' + tagPairs.map(p => '<span class="tag-chip">' + p[0] + ' ' + escapeHtml(p[1]) + '</span>').join('') + '</div></div>' : '') +
@@ -511,15 +577,16 @@ async function openItemDetail(entryId) {
 
     (item.notes ? '<div class="card"><p style="font-size:13px; font-weight:500; margin:0 0 6px;">Notes</p><p style="font-size:13px; color:var(--text-secondary); margin:0;">' + escapeHtml(item.notes) + '</p></div>' : '') +
 
-    '<div class="btn-row">' +
-    '<button class="btn" id="mark-sold-btn">🏷️ Mark as sold</button>' +
-    '<button class="btn" id="delete-btn" style="color:var(--enamel-red);">🗑️ Delete</button>' +
-    '</div>';
+    (readOnly ? '' :
+      '<div class="btn-row">' +
+      '<button class="btn" id="mark-sold-btn">🏷️ Mark as sold</button>' +
+      '<button class="btn" id="delete-btn" style="color:var(--enamel-red);">🗑️ Delete</button>' +
+      '</div>');
 
   document.getElementById('back-btn').addEventListener('click', renderCollectionTab);
-  document.getElementById('recheck-btn').addEventListener('click', () => recheckValue(entry, item));
-  document.getElementById('mark-sold-btn').addEventListener('click', () => openMarkAsSoldSheet(entry, item));
-  document.getElementById('delete-btn').addEventListener('click', async () => {
+  document.getElementById('recheck-btn')?.addEventListener('click', () => recheckValue(entry, item));
+  document.getElementById('mark-sold-btn')?.addEventListener('click', () => openMarkAsSoldSheet(entry, item));
+  document.getElementById('delete-btn')?.addEventListener('click', async () => {
     if (confirm('Delete "' + item.name + '" from your collection? This can\'t be undone.')) {
       await DB.deleteInventoryEntry(entry.id);
       await DB.deleteItemCascade(item.id);
@@ -631,17 +698,28 @@ function openMarkAsSoldSheet(entry, item) {
 }
 
 async function renderStatsTab() {
-  const entries = await attachItems(await DB.getAllInventoryEntries());
+  const collections = await DB.getAllCollections();
+  const activeCollection = collections.find(c => c.id === state.activeCollectionId) || { id: DB.OWN_COLLECTION_ID, name: 'My Collection', isOwn: true };
+
+  const collectionInventory = await DB.getInventoryEntriesByCollection(state.activeCollectionId);
+  const entries = await attachItems(collectionInventory);
+  const collectionItems = await DB.getItemsByCollection(state.activeCollectionId);
+  const collectionItemIds = new Set(collectionItems.map(i => i.id));
   const allTx = await attachItems(await DB.getAllTransactions());
-  const sold = allTx.filter(t => t.type === 'sold');
+  const sold = allTx.filter(t => t.type === 'sold' && collectionItemIds.has(t.itemId));
 
   const totalValue = entries.reduce((s, e) => s + (e.currentEstimatedValue || 0), 0);
   const totalInvested = entries.reduce((s, e) => s + (e.purchasePrice || 0), 0);
   const unrealizedGain = totalValue - totalInvested;
   const realizedPL = sold.reduce((s, t) => s + (t.profitLoss || 0), 0);
 
+  const collectionBanner = activeCollection.isOwn
+    ? ''
+    : '<div class="card" style="background:rgba(200,140,40,0.08); font-size:12px; margin-bottom:10px;">👀 Showing stats for <strong>' + escapeHtml(activeCollection.name) + '</strong></div>';
+
   if (entries.length === 0) {
     mainEl.innerHTML =
+      collectionBanner +
       '<div class="metric-row">' +
       '<div class="metric-card"><p class="label">Current value</p><p class="value">' + fmtCurrency(0) + '</p></div>' +
       '<div class="metric-card"><p class="label">Total invested</p><p class="value">' + fmtCurrency(0) + '</p></div>' +
@@ -661,7 +739,8 @@ async function renderStatsTab() {
   const facetOptions = Filtering.availableFacets(entries);
   const selectedFacet = state._statsFacet || facetOptions[0];
 
-  let html = '<div class="metric-row">' +
+  let html = collectionBanner +
+    '<div class="metric-row">' +
     '<div class="metric-card"><p class="label">Current value</p><p class="value">' + fmtCurrency(totalValue) + '</p></div>' +
     '<div class="metric-card"><p class="label">Total invested</p><p class="value">' + fmtCurrency(totalInvested) + '</p></div>' +
     '</div>' +

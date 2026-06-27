@@ -22,7 +22,7 @@
 // PWA URL (e.g. https://yourusername.github.io) before going live, or any
 // website could ride on your API quota using your key.
 
-const ALLOWED_ORIGIN = '*'; // TODO: replace with your real PWA origin before going live
+const ALLOWED_ORIGIN = 'https://cfrost3.github.io'; // TODO: replace with your real PWA origin before going live
 
 function corsHeaders() {
   return {

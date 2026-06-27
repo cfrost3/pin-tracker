@@ -6,9 +6,18 @@
 // — IndexedDB has no native relationship/cascade-delete concept, so cascade
 // behavior (e.g. deleting an item's history when the item is deleted) is
 // implemented manually in the delete functions below.
+//
+// COLLECTIONS: every item belongs to a "collection" — your own (read-write)
+// or one imported from a friend (read-only). Inventory/wishlist/
+// transactions/price-history don't carry their own collectionId; they
+// inherit it through whichever item they're linked to, since duplicating
+// it onto every store would just be redundant denormalization with no
+// benefit here (we always have the item in hand before we need to know
+// which collection something belongs to).
 
 const DB_NAME = 'pin-valuator';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
+const OWN_COLLECTION_ID = 'own';
 
 let dbInstance = null;
 
@@ -20,23 +29,63 @@ function openDB() {
 
     request.onupgradeneeded = (event) => {
       const db = event.target.result;
+      const oldVersion = event.oldVersion;
+      const tx = event.target.transaction;
 
-      const items = db.createObjectStore('items', { keyPath: 'id' });
-      items.createIndex('category', 'category');
+      if (oldVersion < 1) {
+        const items = db.createObjectStore('items', { keyPath: 'id' });
+        items.createIndex('category', 'category');
 
-      const inventory = db.createObjectStore('inventory', { keyPath: 'id' });
-      inventory.createIndex('itemId', 'itemId');
-      inventory.createIndex('dateAcquired', 'dateAcquired');
+        const inventory = db.createObjectStore('inventory', { keyPath: 'id' });
+        inventory.createIndex('itemId', 'itemId');
+        inventory.createIndex('dateAcquired', 'dateAcquired');
 
-      const wishlist = db.createObjectStore('wishlist', { keyPath: 'id' });
-      wishlist.createIndex('itemId', 'itemId');
+        const wishlist = db.createObjectStore('wishlist', { keyPath: 'id' });
+        wishlist.createIndex('itemId', 'itemId');
 
-      const transactions = db.createObjectStore('transactions', { keyPath: 'id' });
-      transactions.createIndex('itemId', 'itemId');
-      transactions.createIndex('type', 'type');
+        const transactions = db.createObjectStore('transactions', { keyPath: 'id' });
+        transactions.createIndex('itemId', 'itemId');
+        transactions.createIndex('type', 'type');
 
-      const priceHistory = db.createObjectStore('priceHistory', { keyPath: 'id' });
-      priceHistory.createIndex('itemId', 'itemId');
+        const priceHistory = db.createObjectStore('priceHistory', { keyPath: 'id' });
+        priceHistory.createIndex('itemId', 'itemId');
+      }
+
+      if (oldVersion < 2) {
+        // New in v2: collections store, plus a collectionId index on items
+        // so we can query "everything in collection X" efficiently rather
+        // than loading every item and filtering in JS.
+        const collections = db.createObjectStore('collections', { keyPath: 'id' });
+        collections.createIndex('isOwn', 'isOwn');
+
+        const items = tx.objectStore('items');
+        items.createIndex('collectionId', 'collectionId');
+
+        // Migration: anyone upgrading from v1 has items with no
+        // collectionId at all. Tag every existing item as belonging to
+        // the default "own" collection so nothing they already added
+        // disappears or becomes orphaned after this upgrade.
+        const cursorRequest = items.openCursor();
+        cursorRequest.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) {
+            const record = cursor.value;
+            if (!record.collectionId) {
+              record.collectionId = OWN_COLLECTION_ID;
+              cursor.update(record);
+            }
+            cursor.continue();
+          }
+        };
+
+        collections.transaction.oncomplete = () => {};
+        collections.put({
+          id: OWN_COLLECTION_ID,
+          name: 'My Collection',
+          isOwn: true,
+          importedAt: null
+        });
+      }
     };
 
     request.onsuccess = (event) => {
@@ -104,6 +153,7 @@ const CATEGORIES = {
 function newItem(overrides = {}) {
   return {
     id: uuid(),
+    collectionId: OWN_COLLECTION_ID,
     category: 'pin',
     name: '',
     series: null,
@@ -137,6 +187,62 @@ async function getItem(id) {
 
 async function getAllItems() {
   return getAll('items');
+}
+
+async function getItemsByCollection(collectionId) {
+  return getByIndex('items', 'collectionId', collectionId);
+}
+
+// MARK: - Collections
+
+/// A collection is either your own (editable) or one imported from a
+/// friend's exported file (read-only, viewable for comparison). Inventory,
+/// wishlist, transaction, and price-history records aren't tagged with a
+/// collectionId directly — they inherit it from whichever item they
+/// reference, since every call site that needs to know "which collection"
+/// already has the item in hand.
+function newCollection(overrides = {}) {
+  return {
+    id: uuid(),
+    name: 'Imported collection',
+    isOwn: false,
+    importedAt: Date.now(),
+    ...overrides
+  };
+}
+
+async function saveCollection(collection) {
+  return put('collections', collection);
+}
+
+async function getAllCollections() {
+  return getAll('collections');
+}
+
+async function getCollection(id) {
+  const db = await openDB();
+  const store = tx(db, ['collections'], 'readonly').objectStore('collections');
+  return promisifyRequest(store.get(id));
+}
+
+/// Deletes an imported collection and every item/inventory/wishlist/
+/// transaction/price-history record that belongs to it, plus their
+/// photos. Refuses to delete the owner's own collection — that's not a
+/// supported action from this function (there's nothing to "remove" your
+/// own collection into; clearing it would mean deleting records
+/// individually, which the existing per-item delete already supports).
+async function deleteCollectionCascade(collectionId) {
+  if (collectionId === OWN_COLLECTION_ID) {
+    throw new Error('Cannot delete your own collection.');
+  }
+  const items = await getItemsByCollection(collectionId);
+  for (const item of items) {
+    await deleteItemCascade(item.id);
+    if (item.userImagePhotoBlobKey) {
+      await Photos.deletePhoto(item.userImagePhotoBlobKey);
+    }
+  }
+  await deleteRecord('collections', collectionId);
 }
 
 /// Deletes an item and cascades to every dependent record — IndexedDB has
@@ -183,6 +289,16 @@ async function getAllInventoryEntries() {
   return getAll('inventory');
 }
 
+/// Inventory entries don't carry collectionId directly (see note at top of
+/// file), so this joins through items first to find which inventory
+/// entries belong to the given collection.
+async function getInventoryEntriesByCollection(collectionId) {
+  const items = await getItemsByCollection(collectionId);
+  const itemIds = new Set(items.map(i => i.id));
+  const all = await getAllInventoryEntries();
+  return all.filter(e => itemIds.has(e.itemId));
+}
+
 async function deleteInventoryEntry(id) {
   return deleteRecord('inventory', id);
 }
@@ -213,6 +329,13 @@ async function saveWishlistEntry(entry) {
 
 async function getAllWishlistEntries() {
   return getAll('wishlist');
+}
+
+async function getWishlistEntriesByCollection(collectionId) {
+  const items = await getItemsByCollection(collectionId);
+  const itemIds = new Set(items.map(i => i.id));
+  const all = await getAllWishlistEntries();
+  return all.filter(e => itemIds.has(e.itemId));
 }
 
 async function deleteWishlistEntry(id) {
@@ -283,9 +406,11 @@ function isLowConfidence(snapshot) {
 window.DB = {
   openDB,
   CATEGORIES,
-  newItem, saveItem, getItem, getAllItems, deleteItemCascade,
-  newInventoryEntry, saveInventoryEntry, getAllInventoryEntries, deleteInventoryEntry, percentChange,
-  newWishlistEntry, saveWishlistEntry, getAllWishlistEntries, deleteWishlistEntry, isBelowTarget,
+  OWN_COLLECTION_ID,
+  newItem, saveItem, getItem, getAllItems, getItemsByCollection, deleteItemCascade,
+  newCollection, saveCollection, getAllCollections, getCollection, deleteCollectionCascade,
+  newInventoryEntry, saveInventoryEntry, getAllInventoryEntries, getInventoryEntriesByCollection, deleteInventoryEntry, percentChange,
+  newWishlistEntry, saveWishlistEntry, getAllWishlistEntries, getWishlistEntriesByCollection, deleteWishlistEntry, isBelowTarget,
   newTransaction, saveTransaction, getAllTransactions,
   newPriceSnapshot, savePriceSnapshot, getPriceHistoryForItem, isLowConfidence,
   LOW_CONFIDENCE_THRESHOLD,

@@ -23,13 +23,23 @@ const ExportImport = (() => {
 
   // MARK: - Export
 
-  async function buildExportPayload() {
-    const [items, inventory, wishlist, transactions] = await Promise.all([
+  async function buildExportPayload(ownerName) {
+    const [allItems, allInventory, allWishlist, allTransactions] = await Promise.all([
       DB.getAllItems(),
       DB.getAllInventoryEntries(),
       DB.getAllWishlistEntries(),
       DB.getAllTransactions()
     ]);
+
+    // Only export your OWN collection's data — if you've already imported
+    // a friend's collection into this same app instance, re-exporting
+    // should never re-bundle their data as if it were yours to share
+    // onward.
+    const items = allItems.filter(i => i.collectionId === DB.OWN_COLLECTION_ID || !i.collectionId);
+    const ownItemIds = new Set(items.map(i => i.id));
+    const inventory = allInventory.filter(e => ownItemIds.has(e.itemId));
+    const wishlist = allWishlist.filter(e => ownItemIds.has(e.itemId));
+    const transactions = allTransactions.filter(t => ownItemIds.has(t.itemId));
 
     const priceHistoryByItem = {};
     for (const item of items) {
@@ -49,6 +59,7 @@ const ExportImport = (() => {
     return {
       formatVersion: FORMAT_VERSION,
       exportedAt: new Date().toISOString(),
+      ownerName: ownerName || null,
       appName: 'Pin Valuator',
       items,
       inventory,
@@ -77,13 +88,14 @@ const ExportImport = (() => {
   /// this via the system share/save sheet rather than a desktop-style
   /// downloads folder, which is the expected behavior for sharing the
   /// file via Messages, AirDrop, Files, email, etc.
-  async function exportToFile() {
-    const payload = await buildExportPayload();
+  async function exportToFile(ownerName) {
+    const payload = await buildExportPayload(ownerName);
     const json = JSON.stringify(payload, null, 0);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
 
-    const filename = 'pin-collection-' + new Date().toISOString().slice(0, 10) + '.json';
+    const safeName = (ownerName || 'my').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'my';
+    const filename = 'pin-collection-' + safeName + '-' + new Date().toISOString().slice(0, 10) + '.json';
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
@@ -133,11 +145,20 @@ const ExportImport = (() => {
     };
   }
 
-  /// Actually writes the imported records to IndexedDB. Every record gets
-  /// a fresh id; a lookup map translates old item ids to new ones so
-  /// inventory/wishlist/transaction/price-history records stay correctly
-  /// linked to their (renumbered) item after import.
-  async function commitImport(payload) {
+  /// Creates a new, separate, read-only collection for the imported data
+  /// and writes every record into it. Every record gets a fresh id; a
+  /// lookup map translates old item ids to new ones so inventory/wishlist/
+  /// transaction/price-history records stay correctly linked to their
+  /// (renumbered) item after import. Nothing here ever touches the
+  /// importer's own collection — this is intentionally additive and
+  /// isolated, not a merge.
+  async function commitImport(payload, collectionName) {
+    const collection = DB.newCollection({
+      name: collectionName || payload.ownerName || 'Imported collection',
+      isOwn: false
+    });
+    await DB.saveCollection(collection);
+
     const oldIdToNewId = {};
     let importedItems = 0, importedInventory = 0, importedWishlist = 0, importedTransactions = 0, importedSnapshots = 0;
 
@@ -151,7 +172,7 @@ const ExportImport = (() => {
         newPhotoKey = await Photos.savePhoto(blob);
       }
 
-      const newItem = { ...oldItem, id: newId, userImagePhotoBlobKey: newPhotoKey };
+      const newItem = { ...oldItem, id: newId, collectionId: collection.id, userImagePhotoBlobKey: newPhotoKey };
       await DB.saveItem(newItem);
       importedItems++;
     }
@@ -187,7 +208,7 @@ const ExportImport = (() => {
       }
     }
 
-    return { importedItems, importedInventory, importedWishlist, importedTransactions, importedSnapshots };
+    return { collection, importedItems, importedInventory, importedWishlist, importedTransactions, importedSnapshots };
   }
 
   return { exportToFile, parseImportFile, commitImport };
