@@ -20,6 +20,7 @@ const ASSETS = [
   './js/identify-pipeline.js',
   './js/lot-detection.js',
   './js/export-import.js',
+  './js/sold-listings-display.js',
   './js/scan.js',
   './js/lot-scan.js',
   './js/app.js',

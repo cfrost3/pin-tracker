@@ -384,6 +384,14 @@ function newPriceSnapshot(itemId, overrides = {}) {
     estimatedValueHigh: 0,
     estimatedValueMedian: 0,
     sampleSize: 0,
+    // The individual comps (title, price, url) that fed into this
+    // estimate, so the detail view can show "here's what sold for what"
+    // rather than just the rolled-up low/high/median numbers. Optional —
+    // older snapshots created before this field existed simply won't
+    // have it, and callers should treat a missing/empty array as "detail
+    // not available for this snapshot" rather than an error.
+    listings: [],
+    source: null,
     ...overrides
   };
 }

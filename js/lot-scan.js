@@ -52,13 +52,13 @@ const LotScan = (() => {
   }
 
   async function startCamera() {
-    const video = document.getElementById('lot-camera-video');
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1920 } },
         audio: false
       });
-      video.srcObject = mediaStream;
+      const freshVideo = document.getElementById('lot-camera-video');
+      if (freshVideo) freshVideo.srcObject = mediaStream;
     } catch (err) {
       const frame = document.getElementById('lot-camera-frame');
       if (frame) {
@@ -387,7 +387,9 @@ const LotScan = (() => {
           estimatedValueLow: r.priceEstimate.low,
           estimatedValueHigh: r.priceEstimate.high,
           estimatedValueMedian: r.priceEstimate.median,
-          sampleSize: r.priceEstimate.sampleSize
+          sampleSize: r.priceEstimate.sampleSize,
+          listings: r.priceEstimate.listings || [],
+          source: r.priceEstimate.source || null
         }));
       }
 

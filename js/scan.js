@@ -108,14 +108,21 @@ const Scan = (() => {
         video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 1280 } },
         audio: false
       });
-      video.srcObject = mediaStream;
+      // Re-check rather than trust the captured `video` reference — if the
+      // user navigated away from the Scan tab while getUserMedia was
+      // pending, the element (and the whole screen) may no longer exist.
+      const freshVideo = document.getElementById('camera-video');
+      if (freshVideo) freshVideo.srcObject = mediaStream;
     } catch (err) {
       // Common causes: not served over HTTPS, permission denied, or no
       // camera available (desktop browser without a webcam). Fall back to
       // the file picker so the flow isn't a dead end.
-      document.getElementById('camera-frame').innerHTML =
-        '<div style="display:flex; align-items:center; justify-content:center; height:100%; color:#aaa; font-size:12px; text-align:center; padding:20px;">' +
-        'Camera unavailable (' + escapeAttr(err.message) + ').<br>Use the photo picker below instead.</div>';
+      const frame = document.getElementById('camera-frame');
+      if (frame) {
+        frame.innerHTML =
+          '<div style="display:flex; align-items:center; justify-content:center; height:100%; color:#aaa; font-size:12px; text-align:center; padding:20px;">' +
+          'Camera unavailable (' + escapeAttr(err.message) + ').<br>Use the photo picker below instead.</div>';
+      }
     }
   }
 
@@ -245,6 +252,7 @@ const Scan = (() => {
             '<p style="font-size:26px; font-weight:600; margin:6px 0 2px;">' + fmtCurrencyLocal(priceEstimate.low) + '–' + fmtCurrencyLocal(priceEstimate.high) + '</p>' +
             '<p style="font-size:12px; color:var(--text-secondary); margin:0;">Median ' + fmtCurrencyLocal(priceEstimate.median) + ', as of today</p>' +
             (priceEstimate.sampleSize < DB.LOW_CONFIDENCE_THRESHOLD ? '<p style="font-size:11px; color:#a06b1f; margin-top:6px;">⚠️ Low confidence — small sample size</p>' : '') +
+            renderSoldListingsToggle(priceEstimate, 'scan-result') +
             '</div>'
           : '') +
         (best
@@ -254,6 +262,8 @@ const Scan = (() => {
 
       const editBtn = document.getElementById('edit-tags-btn');
       if (editBtn) editBtn.addEventListener('click', openTagEditor);
+
+      attachSoldListingsToggleHandler('scan-result');
 
       document.getElementById('add-inventory-btn')?.addEventListener('click', () => commitItem('inventory'));
       document.getElementById('add-wishlist-btn')?.addEventListener('click', () => commitItem('wishlist'));
@@ -311,7 +321,8 @@ const Scan = (() => {
       if (priceEstimate) {
         await DB.savePriceSnapshot(DB.newPriceSnapshot(item.id, {
           estimatedValueLow: priceEstimate.low, estimatedValueHigh: priceEstimate.high,
-          estimatedValueMedian: priceEstimate.median, sampleSize: priceEstimate.sampleSize
+          estimatedValueMedian: priceEstimate.median, sampleSize: priceEstimate.sampleSize,
+          listings: priceEstimate.listings || [], source: priceEstimate.source || null
         }));
       }
 

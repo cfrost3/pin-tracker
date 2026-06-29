@@ -7,6 +7,5 @@
 // randomized prices, clearly not real data).
 
 const BackendConfig = {
-  // e.g. 'https://pin-valuator-backend.your-subdomain.workers.dev'
   WORKER_BASE_URL: 'https://pin-valuator-backend.pin-tracker.workers.dev'
 };

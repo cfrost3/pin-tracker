@@ -102,13 +102,22 @@ You'll end up with either:
 
 ## Part 4 -- Lock down CORS (do this before relying on it long-term)
 
-Open `worker.js` and find this line near the top:
+**Already set for this deployment** -- `worker.js` has:
 
 ```js
-const ALLOWED_ORIGIN = '*';
+const ALLOWED_ORIGIN = 'https://cfrost3.github.io';
 ```
 
-Change `'*'` to your actual deployed PWA URL, e.g.:
+⚠️ **Action needed:** this value is set in the file you have locally, but
+the Worker currently live at `pin-valuator-backend.pin-tracker.workers.dev`
+was deployed before this change, so it's still running with the old `'*'`
+(open to any origin). Run `wrangler deploy` from this folder once to push
+the updated `worker.js` and actually lock it down. Until you do, the app
+still works fine -- this is a tightening step, not something broken.
+
+For reference, the general version of this step: open `worker.js`, find
+the `ALLOWED_ORIGIN` line near the top, and set it to your actual deployed
+PWA's origin (scheme + host only, no path):
 
 ```js
 const ALLOWED_ORIGIN = 'https://yourusername.github.io';
@@ -123,16 +132,24 @@ you have a real deployed URL.
 
 ## Part 5 -- Point the PWA at your Worker
 
-Open `js/backend-config.js` in the PWA project. Find:
+**Already done for this deployment** -- `js/backend-config.js` in the PWA
+project is pre-filled with:
 
 ```js
 const BackendConfig = {
-  WORKER_BASE_URL: null
+  WORKER_BASE_URL: 'https://pin-valuator-backend.pin-tracker.workers.dev'
 };
 ```
 
-Change `null` to your deployed Worker's base URL (no trailing slash, no
-`/match` or `/price` -- those paths get appended automatically):
+If you ever redeploy the Worker under a different name or subdomain, this
+is the one line to update -- both `image-match-service.js` and
+`price-service.js` read from it automatically, no other file needs
+touching.
+
+For reference, here's the general version of this step for anyone
+starting fresh: open `js/backend-config.js`, change `WORKER_BASE_URL` to
+your deployed Worker's base URL (no trailing slash, no `/match` or
+`/price` suffix -- those paths get appended automatically):
 
 ```js
 const BackendConfig = {

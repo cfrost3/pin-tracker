@@ -22,7 +22,7 @@
 // PWA URL (e.g. https://yourusername.github.io) before going live, or any
 // website could ride on your API quota using your key.
 
-const ALLOWED_ORIGIN = 'https://cfrost3.github.io'; // TODO: replace with your real PWA origin before going live
+const ALLOWED_ORIGIN = 'https://cfrost3.github.io';
 
 function corsHeaders() {
   return {
@@ -48,6 +48,9 @@ export default {
     }
 
     try {
+      if (url.pathname === '/health' && request.method === 'GET') {
+        return await handleHealth(env);
+      }
       if (url.pathname === '/match' && request.method === 'POST') {
         return await handleMatch(request, env);
       }
@@ -61,6 +64,28 @@ export default {
     }
   }
 };
+
+// MARK: - /health — diagnostic endpoint, no image/API calls required
+//
+// Visit this URL directly in a browser (e.g.
+// https://your-worker.workers.dev/health) any time you want to check
+// whether the Worker is deployed and which secrets it can see, WITHOUT
+// spending an actual Vision API or eBay request. This only checks
+// whether each secret is *present*, not whether its value is valid —
+// a present-but-wrong key will still show "configured" here, but will
+// fail with a specific error message when you actually try /match or
+// /price, which is the next thing to check (see the "Test image search"
+// button on the PWA's Scan tab).
+async function handleHealth(env) {
+  return jsonResponse({
+    status: 'ok',
+    workerDeployed: true,
+    googleVisionKeyConfigured: Boolean(env.GOOGLE_VISION_API_KEY),
+    ebayMarketplaceTokenConfigured: Boolean(env.EBAY_MARKETPLACE_TOKEN),
+    priceSourceIfNoToken: 'scrape_fallback',
+    timestamp: new Date().toISOString()
+  });
+}
 
 // MARK: - /match — Google Cloud Vision Web Detection
 
@@ -91,14 +116,43 @@ async function handleMatch(request, env) {
   );
 
   if (!visionResponse.ok) {
-    const errText = await visionResponse.text();
-    console.error('Vision API error:', errText);
-    return jsonResponse({ error: 'Vision API request failed' }, 502);
+    // Forward Google's actual error message rather than a generic one —
+    // this is almost always the most useful diagnostic signal available.
+    // Common real-world causes you'll see surfaced here:
+    //   - "API key not valid" -> key was mistyped or regenerated since
+    //   - "Cloud Vision API has not been used in project ... before or it
+    //     is disabled" -> the API wasn't enabled in Part 1, step 3
+    //   - "This API method requires billing to be enabled" -> no billing
+    //     account attached to the Google Cloud project
+    //   - "API key not authorized for this API" -> the key restriction
+    //     in Part 1 step 6 was set to the wrong API
+    let detail = await visionResponse.text();
+    try {
+      const parsed = JSON.parse(detail);
+      detail = parsed.error?.message || detail;
+    } catch (e) {
+      // Not JSON — keep the raw text as-is.
+    }
+    console.error('Vision API error:', detail);
+    return jsonResponse({
+      error: 'Vision API request failed (' + visionResponse.status + '): ' + detail
+    }, 502);
   }
 
   const data = await visionResponse.json();
   const matches = parseVisionResponse(data);
-  return jsonResponse({ matches });
+
+  // Diagnostic counts, always included even when matches is non-empty —
+  // these tell you WHY a result looks the way it does (e.g. "0 pages
+  // found, falling back to a best-guess label" vs "8 pages found, here
+  // are the top 8") without needing to inspect raw Vision output.
+  const webDetection = data.responses?.[0]?.webDetection || {};
+  const diagnostics = {
+    pagesWithMatchingImagesCount: (webDetection.pagesWithMatchingImages || []).length,
+    visuallySimilarImagesCount: (webDetection.visuallySimilarImages || []).length,
+    bestGuessLabel: webDetection.bestGuessLabels?.[0]?.label || null
+  };
+  return jsonResponse({ matches, diagnostics });
 }
 
 function arrayBufferToBase64(buffer) {
@@ -179,8 +233,8 @@ async function handlePrice(url, env) {
   // for this specific eBay partner program and have a valid OAuth token.
   if (env.EBAY_MARKETPLACE_TOKEN) {
     try {
-      const prices = await fetchFromMarketplaceInsights(query, categoryId, env.EBAY_MARKETPLACE_TOKEN);
-      if (prices.length > 0) return jsonResponse({ prices, source: 'marketplace_insights' });
+      const listings = await fetchFromMarketplaceInsights(query, categoryId, env.EBAY_MARKETPLACE_TOKEN);
+      if (listings.length > 0) return jsonResponse({ listings, source: 'marketplace_insights' });
     } catch (err) {
       console.warn('Marketplace Insights failed, falling back to scrape:', err.message);
     }
@@ -196,11 +250,11 @@ async function handlePrice(url, env) {
   // that as a signal to apply for real API access instead of patching
   // the scraper repeatedly.
   try {
-    const prices = await scrapeEbaySoldListings(query);
-    return jsonResponse({ prices, source: 'scrape_fallback' });
+    const listings = await scrapeEbaySoldListings(query);
+    return jsonResponse({ listings, source: 'scrape_fallback' });
   } catch (err) {
     console.error('Scrape fallback failed:', err.message);
-    return jsonResponse({ error: 'Could not retrieve price data', prices: [] }, 502);
+    return jsonResponse({ error: 'Could not retrieve price data', listings: [] }, 502);
   }
 }
 
@@ -216,15 +270,39 @@ async function fetchFromMarketplaceInsights(query, categoryId, token) {
 
   const data = await response.json();
   return (data.itemSales || [])
-    .map(sale => parseFloat(sale.lastSoldPrice?.value))
-    .filter(p => !isNaN(p));
+    .map(sale => {
+      const price = parseFloat(sale.lastSoldPrice?.value);
+      if (isNaN(price)) return null;
+      return {
+        price,
+        title: sale.title || null,
+        url: sale.itemWebUrl || sale.itemHref || null,
+        // Marketplace Insights doesn't return a per-sale sold date in
+        // every response shape; leave null rather than guess.
+        date: sale.lastSoldDate || null
+      };
+    })
+    .filter(Boolean);
 }
 
 /// Scrapes eBay's sold-listings search page (LH_Sold=1&LH_Complete=1).
-/// Parses prices out of the rendered HTML with a regex rather than a full
-/// DOM parser, since Workers don't have DOM APIs available — this is
-/// brittle (see warning above) but avoids pulling in a heavy HTML-parsing
-/// dependency for what's meant to be a lightweight fallback.
+/// Parses listing cards out of the rendered HTML with regexes rather than
+/// a full DOM parser, since Workers don't have DOM APIs available — this
+/// is brittle (see warning above) but avoids pulling in a heavy
+/// HTML-parsing dependency for what's meant to be a lightweight fallback.
+///
+/// Each eBay search result item is roughly structured as:
+///   <a class="s-item__link" href="https://www.ebay.com/itm/...">
+///     <div class="s-item__title">Disney Pin 14829 Hercules...</div>
+///   </a>
+///   ...
+///   <span class="s-item__price">$42.00</span>
+/// This function splits the page into per-item chunks first, then pulls
+/// title/url/price out of each chunk — extracting all three from one
+/// shared chunk (rather than three separate global regex passes) is what
+/// keeps title and price correctly paired to the SAME listing rather than
+/// accidentally zippering listing #3's title with listing #7's price if
+/// one of them didn't match for some item.
 async function scrapeEbaySoldListings(query) {
   const searchUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_sop=13`;
 
@@ -239,13 +317,45 @@ async function scrapeEbaySoldListings(query) {
 
   const html = await response.text();
 
-  // eBay's sold-price spans currently render like: <span class="s-item__price">$42.00</span>
-  // This WILL need adjustment if eBay changes their markup — that's the
-  // core fragility of this fallback path.
-  const priceMatches = [...html.matchAll(/s-item__price[^>]*>\s*\$?([\d,]+\.\d{2})/g)];
-  const prices = priceMatches
-    .map(m => parseFloat(m[1].replace(/,/g, '')))
-    .filter(p => !isNaN(p) && p > 0 && p < 5000); // sanity bounds against parsing garbage
+  // Split into per-listing chunks on the result-item wrapper. This WILL
+  // need adjustment if eBay changes their markup — that's the core
+  // fragility of this fallback path.
+  const itemChunks = html.split('s-item__wrapper').slice(1); // first slice is page chrome before the first item
 
-  return prices.slice(0, 30);
+  const listings = [];
+  for (const chunk of itemChunks) {
+    const priceMatch = chunk.match(/s-item__price[^>]*>\s*\$?([\d,]+\.\d{2})/);
+    if (!priceMatch) continue;
+    const price = parseFloat(priceMatch[1].replace(/,/g, ''));
+    if (isNaN(price) || price <= 0 || price >= 5000) continue; // sanity bounds against parsing garbage
+
+    const titleMatch = chunk.match(/s-item__title[^>]*>(?:<span[^>]*>)?([^<]+)/);
+    const urlMatch = chunk.match(/href="(https:\/\/www\.ebay\.com\/itm\/[^"]+)"/);
+
+    listings.push({
+      price,
+      title: titleMatch ? decodeHtmlEntities(titleMatch[1].trim()) : null,
+      url: urlMatch ? urlMatch[1] : null,
+      // eBay's search results page doesn't reliably expose a per-item
+      // sold date in a consistent, easily-regexable spot across all
+      // layouts — leaving this null rather than guessing wrong.
+      date: null
+    });
+
+    if (listings.length >= 30) break;
+  }
+
+  return listings;
+}
+
+/// Minimal HTML entity decoder for the handful of entities that actually
+/// show up in eBay listing titles (ampersands, quotes). Not a general
+/// HTML decoder — just enough to make titles like "Mickey &amp; Friends"
+/// read correctly instead of showing literal entity codes.
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
 }

@@ -1,13 +1,39 @@
 // app.js — view router + screens for Collection and Stats tabs.
 // Scan tab logic lives in scan.js since it's substantial on its own.
 
+const VIEW_MODE_STORAGE_KEY = 'pin-valuator-view-mode';
+
+/// Grid (photo thumbnails) vs. list (compact text rows, no images
+/// rendered) for the inventory. This is a UI preference, not collection
+/// data, so it's stored in localStorage rather than IndexedDB — it
+/// doesn't need to be part of an export/import, and reading it
+/// synchronously at startup avoids a flash of the wrong layout before an
+/// async IndexedDB read could resolve.
+function loadViewMode() {
+  try {
+    const saved = localStorage.getItem(VIEW_MODE_STORAGE_KEY);
+    return saved === 'list' ? 'list' : 'grid';
+  } catch (err) {
+    return 'grid'; // localStorage can throw in some locked-down contexts (e.g. private browsing edge cases)
+  }
+}
+
+function saveViewMode(mode) {
+  try {
+    localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode);
+  } catch (err) {
+    // Non-fatal — the preference just won't persist this session.
+  }
+}
+
 const state = {
   activeTab: 'scan',
   collectionSegment: 'inventory', // inventory | wishlist | ledger
   categoryFilter: null,
   activeFilter: Filtering.createActiveFilter(),
   sortOption: 'dateAcquiredNewest',
-  activeCollectionId: DB.OWN_COLLECTION_ID
+  activeCollectionId: DB.OWN_COLLECTION_ID,
+  viewMode: loadViewMode() // grid | list
 };
 
 /// True when the currently-viewed collection is read-only (i.e. it's an
@@ -66,15 +92,20 @@ function showToast(message) {
   setTimeout(() => el.remove(), 2200);
 }
 
+let sheetGeneration = 0;
+
 function openSheet(html, onMount) {
+  sheetGeneration++;
   sheetRoot.innerHTML = '<div class="sheet-overlay" id="sheet-overlay"><div class="sheet">' + html + '</div></div>';
   document.getElementById('sheet-overlay').addEventListener('click', (e) => {
     if (e.target.id === 'sheet-overlay') closeSheet();
   });
   if (onMount) onMount();
+  return sheetGeneration;
 }
 
 function closeSheet() {
+  sheetGeneration++;
   sheetRoot.innerHTML = '';
 }
 
@@ -121,7 +152,9 @@ async function renderCollectionTab() {
         '<span style="font-size:12px;">👀 Viewing <strong>' + escapeHtml(activeCollection.name) + '</strong> — read-only</span>' +
         '<button id="remove-collection-btn" style="background:none; border:none; color:var(--enamel-red); font-size:12px;">Remove</button>' +
         '</div>'
-      : '<div style="display:flex; justify-content:flex-end; margin-bottom:8px;">' +
+      : '<div style="display:flex; justify-content:flex-end; gap:8px; margin-bottom:8px; flex-wrap:wrap;">' +
+        '<button class="chip" id="backend-diag-btn">🔌 Backend</button>' +
+        '<button class="chip" id="refresh-all-btn">↻ Refresh all values</button>' +
         '<button class="chip" id="export-import-btn">⇄ Export / Import</button>' +
         '</div>') +
     '<div class="segmented" id="collection-segmented">' +
@@ -140,6 +173,8 @@ async function renderCollectionTab() {
   });
 
   document.getElementById('export-import-btn')?.addEventListener('click', openExportImportSheet);
+  document.getElementById('refresh-all-btn')?.addEventListener('click', openRefreshAllValuesSheet);
+  document.getElementById('backend-diag-btn')?.addEventListener('click', openBackendDiagnosticsSheet);
   document.getElementById('remove-collection-btn')?.addEventListener('click', async () => {
     if (confirm('Remove "' + activeCollection.name + '" from your view? This deletes the imported copy on this device only — it does not affect their actual collection.')) {
       await DB.deleteCollectionCascade(activeCollection.id);
@@ -166,6 +201,112 @@ async function renderCollectionTab() {
 }
 
 // MARK: - Export / Import
+
+// MARK: - Backend connectivity diagnostics
+
+/// Two-step diagnostic: first a /health check (no API calls spent, just
+/// confirms the Worker is deployed and which secrets it sees), then an
+/// optional real test search against a tiny synthetic image, which
+/// exercises the actual Vision API call end to end and shows you exactly
+/// what came back — real matches, a real error message, or a clear
+/// explanation of why zero results is the expected (not broken) outcome
+/// for that particular test image.
+function openBackendDiagnosticsSheet() {
+  const myGeneration = openSheet(
+    '<div class="sheet-header"><h2>Backend connection</h2><button id="sheet-close">Done</button></div>' +
+    '<div class="card">' +
+    '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Step 1 — Is the Worker reachable?</p>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Checks that your Cloudflare Worker is deployed and which API keys it can see. This makes no Google or eBay calls and costs nothing.</p>' +
+    '<button class="btn block" id="health-check-btn">Check connection</button>' +
+    '<div id="health-result" style="margin-top:10px; font-size:12px;"></div>' +
+    '</div>' +
+    '<div class="card">' +
+    '<p style="font-size:13px; font-weight:500; margin:0 0 4px;">Step 2 — Does image search actually work?</p>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 10px;">Sends a small test image through the real search pipeline and shows you exactly what comes back — including the real error message if something fails. This does use one Vision API request.</p>' +
+    '<button class="btn block" id="test-search-btn">Run test search</button>' +
+    '<div id="test-search-result" style="margin-top:10px; font-size:12px;"></div>' +
+    '</div>',
+    () => {
+      document.getElementById('sheet-close').addEventListener('click', closeSheet);
+
+      document.getElementById('health-check-btn').addEventListener('click', async () => {
+        const resultEl = document.getElementById('health-result');
+        if (resultEl) resultEl.textContent = 'Checking…';
+        const health = await ImageMatchService.testConnection();
+
+        // Guard against the sheet having been closed (or a new one
+        // opened) while this await was pending — checking sheetGeneration
+        // catches that even in cases where a stale-but-still-existing
+        // element of the same id could otherwise be written to by mistake.
+        if (sheetGeneration !== myGeneration) return;
+        const freshResultEl = document.getElementById('health-result');
+        if (!freshResultEl) return;
+
+        if (!health.reachable) {
+          freshResultEl.innerHTML = '<span style="color:var(--enamel-red);">✗ ' + escapeHtml(health.error) + '</span>';
+          return;
+        }
+
+        freshResultEl.innerHTML =
+          '<div style="color:var(--enamel-teal); margin-bottom:6px;">✓ Worker is deployed and reachable</div>' +
+          '<div>Google Vision key configured: ' + (health.googleVisionKeyConfigured ? '✓ yes' : '✗ no — run wrangler secret put GOOGLE_VISION_API_KEY') + '</div>' +
+          '<div>eBay Marketplace token configured: ' + (health.ebayMarketplaceTokenConfigured ? '✓ yes' : '— no (using scrape fallback instead, this is expected if you have not been approved)') + '</div>';
+      });
+
+      document.getElementById('test-search-btn').addEventListener('click', async () => {
+        const resultEl = document.getElementById('test-search-result');
+        if (resultEl) resultEl.textContent = 'Running test search…';
+
+        let html;
+        try {
+          const testBlob = await makeTestImageBlob();
+          const vocabulary = await PinTagExtractor.liveVocabulary();
+          const matches = await ImageMatchService.search(testBlob, vocabulary);
+          const diagnostics = ImageMatchService.getLastDiagnostics();
+
+          html = '<div style="color:var(--enamel-teal); margin-bottom:6px;">✓ Request succeeded — the Vision API call itself is working.</div>';
+
+          if (diagnostics) {
+            html += '<div style="color:var(--text-secondary); margin-bottom:6px;">' +
+              'Pages with matching images found: ' + diagnostics.pagesWithMatchingImagesCount + '<br>' +
+              'Visually similar images found: ' + diagnostics.visuallySimilarImagesCount + '<br>' +
+              (diagnostics.bestGuessLabel ? 'Best guess label: "' + escapeHtml(diagnostics.bestGuessLabel) + '"' : 'No best-guess label returned') +
+              '</div>';
+          }
+
+          if (matches.length === 0 || matches[0].name.includes('demo mode')) {
+            html += '<div style="color:#a06b1f;">This test image is a plain solid color, so finding zero real catalog matches for it is EXPECTED — it has nothing distinctive for Vision to match against the web. ' +
+              'This step succeeding just confirms the API call itself works end to end. ' +
+              'If a real pin photo still returns nothing, the most common causes are: the pin/listing simply isn\'t indexed by Google anywhere online (common for less popular or off-brand pins), the photo is too blurry/dark/cluttered for Vision to extract a useful signature, or the photo needs to be cropped tighter to just the pin against a plain background.</div>';
+          } else {
+            html += '<div>Top match: "' + escapeHtml(matches[0].name) + '" (confidence ' + Math.round(matches[0].confidence * 100) + '%)</div>';
+          }
+        } catch (err) {
+          html = '<span style="color:var(--enamel-red);">✗ ' + escapeHtml(err.message) + '</span>';
+        }
+
+        // Same generation guard as above.
+        if (sheetGeneration !== myGeneration) return;
+        const freshResultEl = document.getElementById('test-search-result');
+        if (freshResultEl) freshResultEl.innerHTML = html;
+      });
+    }
+  );
+}
+
+/// A small, deliberately plain test image (a solid-color square) used only
+/// to exercise the request/response plumbing end to end. It is NOT meant
+/// to produce a real catalog match — see the explanation shown alongside
+/// the result in openBackendDiagnosticsSheet.
+async function makeTestImageBlob() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 200;
+  canvas.height = 200;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#4477aa';
+  ctx.fillRect(0, 0, 200, 200);
+  return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+}
 
 function openExportImportSheet() {
   openSheet(
@@ -259,7 +400,14 @@ async function renderInventoryBody() {
   const body = document.getElementById('collection-body');
   const readOnly = isViewingReadOnlyCollection();
 
-  headerActionsEl.innerHTML = '<button id="sort-btn">⇅</button><button id="filter-btn">▽</button>';
+  headerActionsEl.innerHTML =
+    '<button id="view-toggle-btn" title="Toggle grid/list view">' + (state.viewMode === 'grid' ? '☰' : '⊞') + '</button>' +
+    '<button id="sort-btn">⇅</button><button id="filter-btn">▽</button>';
+  document.getElementById('view-toggle-btn').addEventListener('click', () => {
+    state.viewMode = state.viewMode === 'grid' ? 'list' : 'grid';
+    saveViewMode(state.viewMode);
+    renderInventoryBody();
+  });
   document.getElementById('sort-btn').addEventListener('click', openSortSheet);
   document.getElementById('filter-btn').addEventListener('click', () => openFilterSheet());
 
@@ -304,6 +452,8 @@ async function renderInventoryBody() {
       '<p class="title">' + (allEntries.length === 0 ? 'No items yet' : 'No matches') + '</p>' +
       '<p class="message">' + (allEntries.length === 0 ? (readOnly ? 'This collection has no items.' : 'Scan a pin or other collectible to add it to your collection.') : 'Try a different filter.') + '</p>' +
       '</div>';
+  } else if (state.viewMode === 'list') {
+    html += '<div class="pin-list">' + entries.map(renderPinListRow).join('') + '</div>';
   } else {
     html += '<div class="grid">' + entries.map(renderPinCard).join('') + '</div>';
   }
@@ -325,6 +475,9 @@ async function renderInventoryBody() {
   document.querySelectorAll('.pin-card').forEach(card => {
     card.addEventListener('click', () => openItemDetail(card.dataset.entryId));
   });
+  document.querySelectorAll('.pin-list-row').forEach(row => {
+    row.addEventListener('click', () => openItemDetail(row.dataset.entryId));
+  });
 
   hydrateThumbnails(body);
 }
@@ -339,6 +492,32 @@ function renderPinCard(entry) {
     '<p class="name">' + escapeHtml(item.name) + '</p>' +
     '<p class="series">' + escapeHtml(item.series || '') + '</p>' +
     '<p class="value">' + fmtCurrency(entry.currentEstimatedValue) + '</p>' +
+    '</button>';
+}
+
+/// Text-only row — deliberately never references userImagePhotoBlobKey or
+/// renders a <img>/.thumb element, so list mode never triggers a single
+/// Photos.loadPhotoURL() call. This is the point of the toggle: a fast,
+/// lightweight way to browse a large collection without loading any image
+/// data at all, not just a visually-compact view that still loads photos
+/// in the background.
+function renderPinListRow(entry) {
+  const item = entry._item;
+  if (!item) return '';
+  const pct = DB.percentChange(entry);
+  const pctHtml = pct != null
+    ? '<span class="list-pct ' + (pct >= 0 ? 'gain-text' : 'loss-text') + '">' + (pct >= 0 ? '+' : '') + Math.round(pct) + '%</span>'
+    : '';
+  return '<button class="pin-list-row" data-entry-id="' + entry.id + '">' +
+    '<span class="list-icon">' + DB.CATEGORIES[item.category].icon + '</span>' +
+    '<span class="list-text">' +
+    '<span class="list-name">' + escapeHtml(item.name) + '</span>' +
+    '<span class="list-series">' + escapeHtml(item.series || '') + '</span>' +
+    '</span>' +
+    '<span class="list-value-col">' +
+    '<span class="list-value">' + fmtCurrency(entry.currentEstimatedValue) + '</span>' +
+    pctHtml +
+    '</span>' +
     '</button>';
 }
 
@@ -564,6 +743,7 @@ async function openItemDetail(entryId) {
     '</div>' +
     (history.length >= 2 ? '<canvas id="value-chart" height="120"></canvas>' : '<p style="font-size:12px; color:var(--text-secondary);">Re-check value a few times to build a history chart.</p>') +
     (latest && DB.isLowConfidence(latest) ? '<p style="font-size:11px; color:#a06b1f; margin-top:8px;">⚠️ Low confidence — fewer than ' + DB.LOW_CONFIDENCE_THRESHOLD + ' sold comps found</p>' : '') +
+    (latest ? renderSoldListingsToggle(latest, 'item-detail') : '') +
     (readOnly ? '' : '<button class="btn block" id="recheck-btn" style="margin-top:10px;">↻ Re-check value</button>') +
     '</div>' +
 
@@ -585,6 +765,7 @@ async function openItemDetail(entryId) {
 
   document.getElementById('back-btn').addEventListener('click', renderCollectionTab);
   document.getElementById('recheck-btn')?.addEventListener('click', () => recheckValue(entry, item));
+  attachSoldListingsToggleHandler('item-detail');
   document.getElementById('mark-sold-btn')?.addEventListener('click', () => openMarkAsSoldSheet(entry, item));
   document.getElementById('delete-btn')?.addEventListener('click', async () => {
     if (confirm('Delete "' + item.name + '" from your collection? This can\'t be undone.')) {
@@ -607,7 +788,9 @@ async function recheckValue(entry, item) {
       estimatedValueLow: estimate.low,
       estimatedValueHigh: estimate.high,
       estimatedValueMedian: estimate.median,
-      sampleSize: estimate.sampleSize
+      sampleSize: estimate.sampleSize,
+      listings: estimate.listings || [],
+      source: estimate.source || null
     });
     await DB.savePriceSnapshot(snapshot);
     entry.currentEstimatedValue = estimate.median;
@@ -618,6 +801,102 @@ async function recheckValue(entry, item) {
   } catch (err) {
     showToast(err.message || 'Could not check value right now');
   }
+}
+
+// MARK: - Bulk value refresh
+
+/// Re-checks every item in your OWN collection, one at a time, showing
+/// live progress in a sheet. Deliberately restricted to your own
+/// collection — refreshing a friend's imported (read-only) collection is
+/// blocked even though it would only touch local price-history data on
+/// this device, since "read-only" should be an unambiguous guarantee, not
+/// something with a quiet exception.
+async function openRefreshAllValuesSheet() {
+  if (isViewingReadOnlyCollection()) {
+    showToast("Can't refresh values for a friend's collection — switch to your own first.");
+    return;
+  }
+
+  const collectionInventory = await DB.getInventoryEntriesByCollection(DB.OWN_COLLECTION_ID);
+  if (collectionInventory.length === 0) {
+    showToast('No items in your collection to refresh.');
+    return;
+  }
+
+  let cancelled = false;
+
+  openSheet(
+    '<div class="sheet-header"><h2>Refresh all values</h2><button id="sheet-close">Cancel</button></div>' +
+    '<p style="font-size:12px; color:var(--text-secondary); margin:0 0 14px;">Checking current sold-listing prices for ' + collectionInventory.length + ' item' + (collectionInventory.length === 1 ? '' : 's') + '. This makes one price lookup per item, so it may take a little while and will use some of your API quota.</p>' +
+    '<div id="refresh-progress-bar" style="background:var(--surface-3); border-radius:6px; height:8px; margin-bottom:10px; overflow:hidden;"><div id="refresh-progress-fill" style="background:var(--brass); height:8px; width:0%; transition:width 0.2s;"></div></div>' +
+    '<p id="refresh-progress-text" style="font-size:12px; color:var(--text-secondary); text-align:center; margin:0 0 14px;">Starting…</p>' +
+    '<div id="refresh-log" style="max-height:220px; overflow-y:auto;"></div>',
+    () => {
+      document.getElementById('sheet-close').addEventListener('click', () => {
+        cancelled = true;
+        closeSheet();
+        render();
+      });
+      runBulkRefresh(collectionInventory, () => cancelled);
+    }
+  );
+}
+
+async function runBulkRefresh(entries, isCancelled) {
+  const items = await DB.getAllItems();
+  const itemsById = Object.fromEntries(items.map(i => [i.id, i]));
+  const log = document.getElementById('refresh-log');
+  let succeeded = 0, failed = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    if (isCancelled()) return;
+
+    const entry = entries[i];
+    const item = itemsById[entry.itemId];
+    const progressText = document.getElementById('refresh-progress-text');
+    const progressFill = document.getElementById('refresh-progress-fill');
+    if (!progressText) return; // sheet was closed mid-run
+
+    progressText.textContent = 'Checking ' + (i + 1) + ' of ' + entries.length + '…';
+    progressFill.style.width = Math.round(((i) / entries.length) * 100) + '%';
+
+    if (!item) { failed++; continue; }
+
+    const row = document.createElement('div');
+    row.style.fontSize = '12px';
+    row.style.padding = '4px 0';
+    row.textContent = '⏳ ' + item.name;
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+
+    try {
+      const estimate = await PriceService.estimateValue(item);
+      await DB.savePriceSnapshot(DB.newPriceSnapshot(item.id, {
+        estimatedValueLow: estimate.low,
+        estimatedValueHigh: estimate.high,
+        estimatedValueMedian: estimate.median,
+        sampleSize: estimate.sampleSize,
+        listings: estimate.listings || [],
+        source: estimate.source || null
+      }));
+      entry.currentEstimatedValue = estimate.median;
+      entry.lastValueCheck = Date.now();
+      await DB.saveInventoryEntry(entry);
+      row.textContent = '✓ ' + item.name + ' — ' + fmtCurrency(estimate.median);
+      succeeded++;
+    } catch (err) {
+      row.textContent = '✗ ' + item.name + ' — no comps found';
+      failed++;
+    }
+  }
+
+  const progressFill = document.getElementById('refresh-progress-fill');
+  const progressText = document.getElementById('refresh-progress-text');
+  if (progressFill) progressFill.style.width = '100%';
+  if (progressText) progressText.textContent = 'Done — ' + succeeded + ' updated' + (failed > 0 ? ', ' + failed + ' could not be priced' : '') + '.';
+
+  showToast('Refresh complete');
+  setTimeout(() => { closeSheet(); render(); }, 1200);
 }
 
 function drawValueChart(canvasId, history) {
@@ -717,6 +996,10 @@ async function renderStatsTab() {
     ? ''
     : '<div class="card" style="background:rgba(200,140,40,0.08); font-size:12px; margin-bottom:10px;">👀 Showing stats for <strong>' + escapeHtml(activeCollection.name) + '</strong></div>';
 
+  const refreshButtonHtml = activeCollection.isOwn
+    ? '<button class="btn block" id="stats-refresh-all-btn" style="margin-bottom:14px;">↻ Refresh all values</button>'
+    : '';
+
   if (entries.length === 0) {
     mainEl.innerHTML =
       collectionBanner +
@@ -739,6 +1022,14 @@ async function renderStatsTab() {
   const facetOptions = Filtering.availableFacets(entries);
   const selectedFacet = state._statsFacet || facetOptions[0];
 
+  const oldestCheck = entries.reduce((oldest, e) => {
+    if (!e.lastValueCheck) return oldest;
+    return (oldest === null || e.lastValueCheck < oldest) ? e.lastValueCheck : oldest;
+  }, null);
+  const staleHint = oldestCheck
+    ? '<p style="font-size:11px; color:var(--text-secondary); text-align:center; margin:-8px 0 14px;">Oldest value check: ' + fmtDate(oldestCheck) + '</p>'
+    : '';
+
   let html = collectionBanner +
     '<div class="metric-row">' +
     '<div class="metric-card"><p class="label">Current value</p><p class="value">' + fmtCurrency(totalValue) + '</p></div>' +
@@ -747,7 +1038,9 @@ async function renderStatsTab() {
     '<div class="metric-row">' +
     '<div class="metric-card"><p class="label">Unrealized gain</p><p class="value ' + (unrealizedGain >= 0 ? 'gain' : 'loss') + '">' + fmtSignedCurrency(unrealizedGain) + '</p></div>' +
     '<div class="metric-card"><p class="label">Realized P/L</p><p class="value ' + (realizedPL >= 0 ? 'gain' : 'loss') + '">' + fmtSignedCurrency(realizedPL) + '</p></div>' +
-    '</div>';
+    '</div>' +
+    refreshButtonHtml +
+    staleHint;
 
   if (categories.length > 1) {
     const catSummaries = categories.map(c => ({
@@ -803,6 +1096,8 @@ async function renderStatsTab() {
     state._statsFacet = e.target.value;
     renderStatsTab();
   });
+
+  document.getElementById('stats-refresh-all-btn')?.addEventListener('click', openRefreshAllValuesSheet);
 }
 
 async function countLowConfidence(entries) {
